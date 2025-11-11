@@ -34,7 +34,7 @@ class MainNavigation extends StatefulWidget {
 }
 
 class _MainNavigationState extends State<MainNavigation> {
-  final WebSocketController wsController = WebSocketController();
+  //final WebSocketController wsController = WebSocketController();
   int _selectedIndex = 0;
 
   void _onNavTapped(int index) {
@@ -45,7 +45,7 @@ class _MainNavigationState extends State<MainNavigation> {
 
   List<Widget> get _pages => [
     const HomeScreen(),
-    ScanScreen(wsController: wsController),
+    const DeviceControlPage(),
     const DataScreen(),
     const MenuScreen(),
   ];

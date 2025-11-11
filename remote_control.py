@@ -3,10 +3,32 @@ import subprocess
 import json
 import random
 from websockets import connect, ConnectionClosed
+import uiautomator2 as u2
+import gzip
+import base64
+from io import BytesIO
+import traceback
 
 SERVER_URL = (
     "wss://ywh1uzhhk9.execute-api.us-east-2.amazonaws.com/test?deviceId=testAndroid"
 )
+APP = "eu.deeper.fishdeeper"
+
+
+def capture_ui_state_zipped():
+
+    try:
+        d = u2.connect()
+        xml = d.dump_hierarchy()
+
+        buf = BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode="wb") as f:
+            f.write(xml.encode("utf-8"))
+
+        compressed_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return True, compressed_b64
+    except Exception as e:
+        return False, str(e)
 
 
 def run_as_root(command: str):
@@ -22,7 +44,7 @@ def run_as_root(command: str):
     print("stderr:", stderr.strip())
 
 
-async def handle_command(command):
+async def handle_command(ws, command):
     try:
         data = json.loads(command)
 
@@ -36,7 +58,10 @@ async def handle_command(command):
                 pass
 
         cmd_type = data.get("action") or data.get("type")
+        response = {"action": cmd_type, "status": "ok"}
+        response["target"] = data.get("sender", None)
 
+        # Execute commands
         if cmd_type == "tap":
             x, y = data.get("x"), data.get("y")
             if x is not None and y is not None:
@@ -62,55 +87,329 @@ async def handle_command(command):
 
         elif cmd_type == "restart":
             package = data.get("package") or "eu.deeper.fishdeeper"
-            activity = data.get("activity") or "eu.deeper.app.splash.SplashActivity"
+            activity = (
+                data.get("activity") or "eu.deeper.app.scan.live.MainScreenActivity"
+            )
             run_as_root(f"am force-stop {package}")
             await asyncio.sleep(1.0)
             run_as_root(f"am start -n {package}/{activity}")
             print(f"Restarted: {package}/{activity}")
 
         elif cmd_type == "ping":
-            # no-op
-            pass
-        else:
-            print("Unknown command type:", cmd_type)
+            response["status"] = "pong"
 
-    except json.JSONDecodeError:
-        print("Invalid JSON:", command)
+        elif cmd_type == "clickText":
+            txt = data.get("text")
+            if not txt:
+                response["status"] = "error"
+                response["error"] = "Missing text field"
+            else:
+                try:
+                    d = u2.connect()
+                    print(f"Searching for text: '{txt}'")
+
+                    clicked = False
+
+                    # --- Try exact text match first ---
+                    node = d(text=txt)
+                    if node.exists:
+                        info = node.info
+                        if info.get("clickable"):
+                            node.click()
+                            print(f"Clicked directly on clickable text: {txt}")
+                            clicked = True
+                        else:
+                            # Try clickable ancestor
+                            parent = d.xpath(
+                                f"//*[@text='{txt}']/ancestor::*[@clickable='true']"
+                            )
+                            parents = parent.all()
+                            if parents:
+                                parents[0].click()
+                                print(f"Clicked clickable ancestor for exact '{txt}'")
+                                clicked = True
+                            else:
+                                node.click_exists(timeout=3.0)
+                                print(f"Fallback clicked node for '{txt}'")
+                                clicked = True
+
+                    # --- Try partial match (contains text) ---
+                    if not clicked:
+                        for obj in d.xpath(f"//*[contains(@text,'{txt}')]").all():
+                            info = obj.info
+                            if info.get("clickable"):
+                                obj.click()
+                                print(f"Clicked clickable element containing '{txt}'")
+                                clicked = True
+                                break
+                            else:
+                                parent = d.xpath(
+                                    f"//*[contains(@text,'{txt}')]/ancestor::*[@clickable='true']"
+                                )
+                                parents = parent.all()
+                                if parents:
+                                    parents[0].click()
+                                    print(
+                                        f"Clicked clickable ancestor for partial '{txt}'"
+                                    )
+                                    clicked = True
+                                    break
+
+                    # --- Backwards XML search for preceding Button ---
+                    if not clicked:
+                        print(
+                            f"No clickable node found, searching XML for preceding Button near '{txt}'"
+                        )
+
+                        xml_str = d.dump_hierarchy()
+                        import xml.etree.ElementTree as ET, re
+
+                        root = ET.fromstring(xml_str)
+                        all_nodes = list(root.iter("node"))
+
+                        target_index = None
+                        for i, node in enumerate(all_nodes):
+                            if node.attrib.get("text") == txt:
+                                target_index = i
+                                break
+
+                        if target_index is not None:
+                            button_bounds = None
+                            for j in range(target_index - 1, -1, -1):
+                                cls = all_nodes[j].attrib.get("class", "")
+                                if cls == "android.widget.Button":
+                                    button_bounds = all_nodes[j].attrib.get("bounds")
+                                    print(
+                                        f"Found preceding button for '{txt}': {button_bounds}"
+                                    )
+                                    break
+
+                            if button_bounds:
+                                m = re.match(
+                                    r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", button_bounds
+                                )
+                                if m:
+                                    x1, y1, x2, y2 = map(int, m.groups())
+                                    cx = (x1 + x2) // 2
+                                    cy = (y1 + y2) // 2
+                                    run_as_root(f"input tap {cx} {cy}")
+                                    print(
+                                        f"Tapped at center of preceding button ({cx}, {cy}) for '{txt}'"
+                                    )
+                                    clicked = True
+                                else:
+                                    print(
+                                        f"Invalid bounds format for button: {button_bounds}"
+                                    )
+                            else:
+                                print(
+                                    f"No preceding android.widget.Button found for '{txt}'"
+                                )
+                        else:
+                            print(f"No node found with text='{txt}' in XML tree")
+
+                    response["status"] = "clicked" if clicked else "not_found"
+
+                except Exception as e:
+                    print(f"Error in clickText: {e}")
+                    traceback.print_exc()
+                    response["status"] = "error"
+                    response["error"] = str(e)
+
+        elif cmd_type == "clickById":
+            rid = data.get("resourceId")
+            if not rid:
+                response["status"] = "error"
+                response["error"] = "Missing resourceId field"
+            else:
+                try:
+                    import xml.etree.ElementTree as ET, re
+
+                    d = u2.connect()
+                    print(f"Searching XML for resource-id='{rid}' and nearby Button")
+
+                    xml_str = d.dump_hierarchy()
+                    root = ET.fromstring(xml_str)
+                    all_nodes = list(root.iter("node"))
+
+                    def parse_bounds(b):
+                        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", b)
+                        if not m:
+                            return None
+                        x1, y1, x2, y2 = map(int, m.groups())
+                        return (x1 + x2) // 2, (y1 + y2) // 2
+
+                    target_index = None
+                    for i, node in enumerate(all_nodes):
+                        if node.attrib.get("resource-id", "") == rid:
+                            target_index = i
+                            break
+
+                    if target_index is None:
+                        print(f"No node found with resource-id='{rid}'")
+                        response["status"] = "not_found"
+                    else:
+                        button_bounds = None
+
+                        # --- Search backward first ---
+                        for j in range(target_index - 1, -1, -1):
+                            cls = all_nodes[j].attrib.get("class", "")
+                            if "Button" in cls:
+                                button_bounds = all_nodes[j].attrib.get("bounds")
+                                print(
+                                    f"Found preceding Button for '{rid}': {button_bounds}"
+                                )
+                                break
+
+                        # --- If not found, search forward ---
+                        if not button_bounds:
+                            for j in range(target_index + 1, len(all_nodes)):
+                                cls = all_nodes[j].attrib.get("class", "")
+                                if "Button" in cls:
+                                    button_bounds = all_nodes[j].attrib.get("bounds")
+                                    print(
+                                        f"Found following Button for '{rid}': {button_bounds}"
+                                    )
+                                    break
+
+                        # --- If still not found, try clickable neighbor ---
+                        if not button_bounds:
+                            print(
+                                "No Button class found — trying clickable node near target"
+                            )
+                            for j in range(
+                                max(0, target_index - 5),
+                                min(len(all_nodes), target_index + 5),
+                            ):
+                                clickable = (
+                                    all_nodes[j].attrib.get("clickable") == "true"
+                                )
+                                b = all_nodes[j].attrib.get("bounds")
+                                if clickable and b:
+                                    button_bounds = b
+                                    print(f"Found clickable neighbor: {b}")
+                                    break
+
+                        # --- Perform the click if we found something ---
+                        if button_bounds:
+                            xy = parse_bounds(button_bounds)
+                            if xy:
+                                cx, cy = xy
+                                run_as_root(f"input tap {cx} {cy}")
+                                print(f"Tapped at ({cx}, {cy}) for '{rid}'")
+                                response["status"] = "clicked_button"
+                            else:
+                                print(f"Invalid bounds format for {button_bounds}")
+                                response["status"] = "bad_bounds"
+                        else:
+                            print(f"No clickable element found near '{rid}'")
+                            response["status"] = "no_button"
+
+                except Exception as e:
+                    print(f"Error in clickById: {e}")
+                    traceback.print_exc()
+                    response["status"] = "error"
+                    response["error"] = str(e)
+
+        elif cmd_type == "clickTextDirect":
+            txt = data.get("text")
+            if not txt:
+                response["status"] = "error"
+                response["error"] = "Missing text field"
+            else:
+                try:
+                    import xml.etree.ElementTree as ET, re
+
+                    d = u2.connect()
+                    print(f"Clicking directly on text node '{txt}'")
+
+                    xml_str = d.dump_hierarchy()
+                    root = ET.fromstring(xml_str)
+                    all_nodes = list(root.iter("node"))
+
+                    target_bounds = None
+                    for node in all_nodes:
+                        if node.attrib.get("text") == txt:
+                            target_bounds = node.attrib.get("bounds")
+                            break
+
+                    if target_bounds:
+                        m = re.match(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", target_bounds)
+                        if m:
+                            x1, y1, x2, y2 = map(int, m.groups())
+                            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+                            run_as_root(f"input tap {cx} {cy}")
+                            print(f"Tapped directly at ({cx},{cy}) for '{txt}'")
+                            response["status"] = "clicked_direct_text"
+                        else:
+                            response["status"] = "bad_bounds"
+                    else:
+                        print(f"No node found with text='{txt}'")
+                        response["status"] = "not_found"
+
+                    # return updated UI
+                    await asyncio.sleep(2)
+                    ok, xml_zip = capture_ui_state_zipped()
+                    if ok:
+                        response["ui_state_zip_b64"] = xml_zip
+
+                except Exception as e:
+                    print(f"Error in clickTextDirect: {e}")
+                    traceback.print_exc()
+                    response["status"] = "error"
+                    response["error"] = str(e)
+
+        # Wait for UI to stabilize
+        await asyncio.sleep(10.0)
+
+        ok, data = capture_ui_state_zipped()
+        if ok:
+            response["ui_state_zip_b64"] = data
+        else:
+            response["error"] = data
+
+        await ws.send(json.dumps(response))
+
     except Exception as e:
         print("Error:", e)
+        await ws.send(json.dumps({"error": str(e)}))
 
 
 async def listen():
-    async with connect(
-        SERVER_URL,
-        ping_interval=30,
-        ping_timeout=30,
-        close_timeout=5,
-        max_size=2**20,
-    ) as ws:
-        print("Connected:", SERVER_URL)
+    try:
+        async with connect(
+            SERVER_URL,
+            ping_interval=None,  # disable protocol-level ping for now
+            ping_timeout=None,
+            close_timeout=5,
+            max_size=2**20,
+        ) as ws:
+            print("Connected:", SERVER_URL)
 
-        async def heartbeats(interval=90):
-            try:
+            async def receiver():
                 while True:
-                    await ws.send(json.dumps({"action": "ping"}))
-                    await asyncio.sleep(interval)
-            except asyncio.CancelledError:
-                return
+                    try:
+                        msg = await ws.recv()
+                        print("Raw message:", msg)
+                        await handle_command(ws, msg)
+                    except ConnectionClosed as cc:
+                        print(
+                            f"[receiver] Connection closed: code={cc.code} reason={cc.reason}"
+                        )
+                        raise
+                    except Exception as e:
+                        print(
+                            "[receiver] Exception while receiving or handling message:"
+                        )
+                        traceback.print_exc()
+                        break  # optional: stop loop on error
 
-        async def receiver():
-            while True:
-                msg = await ws.recv()
-                print("Raw message:", msg)
-                await handle_command(msg)
-
-        hb = asyncio.create_task(heartbeats())
-        try:
             await receiver()
-        finally:
-            hb.cancel()
-            with contextlib.suppress(Exception):
-                await hb
+
+    except Exception as e:
+        print("[listen] Exception caught:")
+        traceback.print_exc()
+        raise
 
 
 async def persistent_listener():

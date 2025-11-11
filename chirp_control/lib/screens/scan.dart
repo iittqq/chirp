@@ -1,366 +1,203 @@
-import 'dart:async';
+import 'dart:convert';
 import 'package:flutter/material.dart';
 import '../utils/websocket_controller.dart';
+import 'dart:io';
+import 'package:xml/xml.dart';
 
-class ScanScreen extends StatefulWidget {
-  final WebSocketController wsController;
-
-  const ScanScreen({super.key, required this.wsController});
+class DeviceControlPage extends StatefulWidget {
+  const DeviceControlPage({super.key});
 
   @override
-  State<ScanScreen> createState() => _ScanScreenState();
+  State<DeviceControlPage> createState() => _DeviceControlPageState();
 }
 
-bool showLoading = false;
-bool showPreparing = false;
-
-class _ScanScreenState extends State<ScanScreen> {
-  final TextEditingController nameController = TextEditingController();
-  final TextEditingController hoursController = TextEditingController();
-  final TextEditingController minutesController = TextEditingController();
-  final TextEditingController secondsController = TextEditingController();
-
-  Timer? _countdownTimer;
-  int remainingSeconds = 0;
-
-  final List<String> devices = [
-    "testAndroid",
-    "Bayou Bonfouca",
-    "Lost Lake",
-    "Mid Bretton",
-    "Cole's Bayou",
-    "Northwest Turtle Bayou",
-  ];
-
-  String? selectedDevice;
+class _DeviceControlPageState extends State<DeviceControlPage> {
+  late WebSocketService ws;
+  String uiState = "";
+  bool isConnected = false;
+  bool automationRunning = false;
 
   @override
-  void dispose() {
-    _countdownTimer?.cancel();
-    nameController.dispose();
-    hoursController.dispose();
-    minutesController.dispose();
-    secondsController.dispose();
-    super.dispose();
+  void initState() {
+    super.initState();
+    ws = WebSocketService(deviceId: "controllerFlutter");
+    ws.connect().then((_) {
+      setState(() => isConnected = true);
+    });
+
+    ws.messages.listen((data) {
+      print("Received: $data");
+
+      if (data.containsKey("ui_state_zip_b64")) {
+        setState(() => uiState = "");
+        final xml = decodeZippedXml(data["ui_state_zip_b64"]);
+        setState(() => uiState = xml);
+        if (automationRunning) {
+          analyzeUiXml(xml);
+        }
+      }
+    });
   }
 
-  void startScan() {
-    if (selectedDevice == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Please select a device first")),
-      );
+  String decodeZippedXml(String b64) {
+    final compressedBytes = base64.decode(b64);
+    final decompressed = GZipCodec().decode(compressedBytes);
+    return utf8.decode(decompressed);
+  }
+
+  /// Analyze XML and direct the agent to click specific text
+  void analyzeUiXml(String xml) {
+    final doc = XmlDocument.parse(xml);
+    final nodes = doc.findAllElements('node');
+
+    bool updateFound = false;
+    bool laterFound = false;
+    bool connectFound = false;
+    //bool boatFound = false;
+    bool quickSettingsFound = false;
+    bool pauseFound = false;
+    bool resumeFound = false;
+
+    for (final node in nodes) {
+      final textAttr = node.getAttribute('text') ?? '';
+      final resourceIdAttr = node.getAttribute('resource-id') ?? '';
+      if (textAttr.contains('Update Available')) updateFound = true;
+      if (textAttr.trim() == 'Later') laterFound = true;
+      if (textAttr.trim() == 'Connect') connectFound = true;
+      //if (textAttr.trim() == 'Boat') boatFound = true;
+      if (textAttr.trim() == 'Pause') pauseFound = true;
+      if (textAttr.trim() == 'Resume') resumeFound = true;
+      if (resourceIdAttr.trim() == 'quickSettingsButton') {
+        quickSettingsFound = true;
+      }
+    }
+
+    if (updateFound && laterFound) {
+      print('Detected Update dialog → clicking Later button');
+      _clickByText('Later');
+      return; // wait for next UI update
+    }
+
+    if (connectFound) {
+      print('Clicking Connect button');
+      _clickByText('Connect');
+      return; // wait for next UI update
+    }
+
+    /*
+    if (boatFound) {
+      print('Clicking Boat button');
+      _clickByText('Boat');
+      print('Automation complete ✅');
+      return;
+    }
+*/
+    if (quickSettingsFound) {
+      print('Clicking Quick Settings');
+      _clickById('quickSettingsButton');
       return;
     }
 
-    final name = nameController.text.trim();
-    final hours = int.tryParse(hoursController.text) ?? 0;
-    final minutes = int.tryParse(minutesController.text) ?? 0;
-    final seconds = int.tryParse(secondsController.text) ?? 0;
-    final totalSeconds = Duration(
-      hours: hours,
-      minutes: minutes,
-      seconds: seconds,
-    ).inSeconds;
+    if (pauseFound) {
+      print('Clicking Pause text container directly');
+      _clickByTextDirect('Pause'); // new function
+      return;
+    }
 
-    if (totalSeconds <= 0) return;
-
-    _countdownTimer?.cancel();
-
-    setState(() {
-      showPreparing = true;
-      showLoading = false;
-      remainingSeconds = 0;
-    });
-
-    widget.wsController.testScan(name, totalSeconds, selectedDevice!);
-
-    const warmup = Duration(seconds: 5);
-    Future.delayed(warmup, () {
-      if (!mounted) return;
-      setState(() {
-        showPreparing = false;
-        showLoading = true;
-        remainingSeconds = totalSeconds;
-      });
-
-      _countdownTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-        if (remainingSeconds <= 1) {
-          timer.cancel();
-          endScan();
-        } else {
-          setState(() => remainingSeconds--);
-        }
-      });
-    });
+    if (resumeFound) {
+      print('Clicking Resume text container directly');
+      _clickByTextDirect('Resume'); // new function
+      return;
+    }
   }
 
-  void endScan() {
-    _countdownTimer?.cancel();
-    setState(() {
-      showLoading = false;
-      remainingSeconds = 0;
-      nameController.clear();
-      hoursController.clear();
-      minutesController.clear();
-      secondsController.clear();
-    });
-    widget.wsController.endScan();
+  void _clickById(String resourceId) {
+    final cmd = {
+      "action": "clickById",
+      "resourceId": resourceId,
+      "deviceId": "testAndroid",
+      "sender": "controllerFlutter",
+    };
+    ws.sendCommand(cmd);
+    print("Sent clickById for '$resourceId'");
   }
 
-  String formatCountdown(int totalSeconds) {
-    final mins = totalSeconds ~/ 60;
-    final secs = totalSeconds % 60;
-    return '${mins.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}';
+  /// Sends a semantic clickText command
+  void _clickByText(String label) {
+    final cmd = {
+      "action": "clickText",
+      "text": label,
+      "deviceId": "testAndroid",
+      "sender": "controllerFlutter",
+    };
+    ws.sendCommand(cmd);
+    print("Sent clickText for '$label'");
+  }
+
+  void _clickByTextDirect(String label) {
+    final cmd = {
+      "action": "clickTextDirect",
+      "text": label,
+      "deviceId": "testAndroid",
+      "sender": "controllerFlutter",
+    };
+    ws.sendCommand(cmd);
+    print("Sent clickTextDirect for '$label'");
+  }
+
+  /// Sends the command to launch the app, starting the sequence
+  void startAutomation() {
+    if (!isConnected) return;
+
+    automationRunning = true;
+
+    final launchCmd = {
+      "action": "launch",
+      "package":
+          "eu.deeper.fishdeeper/eu.deeper.app.scan.live.MainScreenActivity",
+      "deviceId": "testAndroid",
+      "sender": "controllerFlutter",
+    };
+
+    ws.sendCommand(launchCmd);
+    print("Sent launch command — automation started");
+  }
+
+  @override
+  void dispose() {
+    ws.disconnect();
+    super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Center(
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              if (!showLoading && !showPreparing)
-                const Text(
-                  'Devices',
-                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+      appBar: AppBar(title: const Text("Deeper Auto Connector")),
+      body: Padding(
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          children: [
+            if (isConnected)
+              const Text("Connected ✅", style: TextStyle(color: Colors.green))
+            else
+              const Text("Connecting...", style: TextStyle(color: Colors.red)),
+            const SizedBox(height: 20),
+            ElevatedButton(
+              onPressed: startAutomation,
+              child: const Text("Start Automation"),
+            ),
+            const SizedBox(height: 20),
+            Expanded(
+              child: SingleChildScrollView(
+                child: Text(
+                  uiState.isNotEmpty ? uiState : "No UI state yet",
+                  style: const TextStyle(fontSize: 12),
                 ),
-              const SizedBox(height: 15),
-              if (!showLoading && !showPreparing)
-                SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  child: Row(
-                    children: devices.map((device) {
-                      final isSelected = selectedDevice == device;
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 6),
-                        child: ChoiceChip(
-                          label: Text(device),
-                          labelStyle: TextStyle(
-                            color: isSelected ? Colors.white : Colors.black,
-                          ),
-                          selected: isSelected,
-                          selectedColor: Colors.indigo,
-                          onSelected: (_) {
-                            setState(() {
-                              selectedDevice = device;
-                            });
-                          },
-                          shape: StadiumBorder(
-                            side: BorderSide(
-                              color: isSelected
-                                  ? Colors.indigo
-                                  : Colors.grey.shade400,
-                            ),
-                          ),
-                        ),
-                      );
-                    }).toList(),
-                  ),
-                ),
-              const SizedBox(height: 20),
-
-              if (!showLoading && !showPreparing)
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.stretch,
-                  children: [
-                    const Center(
-                      child: Text(
-                        'Scan Name',
-                        style: TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 15),
-                    TextField(
-                      controller: nameController,
-                      decoration: InputDecoration(
-                        hintText: 'Enter scan name',
-                        contentPadding: const EdgeInsets.symmetric(
-                          vertical: 14,
-                          horizontal: 16,
-                        ),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(30),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 20),
-                    const Center(
-                      child: Text(
-                        'Duration',
-                        style: TextStyle(
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 15),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            children: [
-                              const Center(child: Text('Hours')),
-                              const SizedBox(height: 4),
-                              TextField(
-                                controller: hoursController,
-                                keyboardType: TextInputType.number,
-                                decoration: InputDecoration(
-                                  hintText: '0',
-                                  contentPadding: const EdgeInsets.symmetric(
-                                    vertical: 14,
-                                    horizontal: 16,
-                                  ),
-                                  border: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(30),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Column(
-                            children: [
-                              const Center(child: Text('Minutes')),
-                              const SizedBox(height: 4),
-                              TextField(
-                                controller: minutesController,
-                                keyboardType: TextInputType.number,
-                                decoration: InputDecoration(
-                                  hintText: '0',
-                                  contentPadding: const EdgeInsets.symmetric(
-                                    vertical: 14,
-                                    horizontal: 16,
-                                  ),
-                                  border: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(30),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Column(
-                            children: [
-                              const Center(child: Text('Seconds')),
-                              const SizedBox(height: 4),
-                              TextField(
-                                controller: secondsController,
-                                keyboardType: TextInputType.number,
-                                decoration: InputDecoration(
-                                  hintText: '0',
-                                  contentPadding: const EdgeInsets.symmetric(
-                                    vertical: 14,
-                                    horizontal: 16,
-                                  ),
-                                  border: OutlineInputBorder(
-                                    borderRadius: BorderRadius.circular(30),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                ),
-
-              if (!showLoading) const SizedBox(height: 24),
-
-              if (showPreparing) ...[
-                const SizedBox(height: 16),
-                const Text(
-                  'Getting scan ready...',
-                  style: TextStyle(fontSize: 16),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 16),
-                const CircularProgressIndicator(),
-              ],
-              if (showPreparing) const SizedBox(height: 24),
-              if (showLoading) ...[
-                const SizedBox(height: 16),
-                const Text(
-                  'Scan status: Running scan...',
-                  style: TextStyle(fontSize: 16),
-                  textAlign: TextAlign.center,
-                ),
-                const SizedBox(height: 16),
-                Text(
-                  formatCountdown(remainingSeconds),
-                  style: const TextStyle(
-                    fontSize: 48,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.lightGreen,
-                  ),
-                ),
-              ],
-
-              ManageScanButtons(
-                onPressedStart: startScan,
-                onPressedFinish: endScan,
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
-    );
-  }
-}
-
-class ManageScanButtons extends StatelessWidget {
-  final VoidCallback onPressedStart;
-  final VoidCallback onPressedFinish;
-
-  const ManageScanButtons({
-    super.key,
-    required this.onPressedStart,
-    required this.onPressedFinish,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        if (!showLoading && !showPreparing)
-          ElevatedButton(
-            onPressed: onPressedStart,
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.indigo,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(30),
-              ),
-            ),
-            child: const Text('Start Scan'),
-          ),
-        const SizedBox(height: 24),
-        if (showLoading || showPreparing)
-          ElevatedButton(
-            onPressed: onPressedFinish,
-            style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.indigo,
-              foregroundColor: Colors.white,
-              padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(30),
-              ),
-            ),
-            child: const Text('Finish Scan'),
-          ),
-      ],
     );
   }
 }
