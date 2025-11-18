@@ -110,7 +110,6 @@ async def handle_command(ws, command):
 
                     clicked = False
 
-                    # --- Try exact text match first ---
                     node = d(text=txt)
                     if node.exists:
                         info = node.info
@@ -119,7 +118,6 @@ async def handle_command(ws, command):
                             print(f"Clicked directly on clickable text: {txt}")
                             clicked = True
                         else:
-                            # Try clickable ancestor
                             parent = d.xpath(
                                 f"//*[@text='{txt}']/ancestor::*[@clickable='true']"
                             )
@@ -133,7 +131,6 @@ async def handle_command(ws, command):
                                 print(f"Fallback clicked node for '{txt}'")
                                 clicked = True
 
-                    # --- Try partial match (contains text) ---
                     if not clicked:
                         for obj in d.xpath(f"//*[contains(@text,'{txt}')]").all():
                             info = obj.info
@@ -155,58 +152,8 @@ async def handle_command(ws, command):
                                     clicked = True
                                     break
 
-                    # --- Backwards XML search for preceding Button ---
                     if not clicked:
-                        print(
-                            f"No clickable node found, searching XML for preceding Button near '{txt}'"
-                        )
-
-                        xml_str = d.dump_hierarchy()
-                        import xml.etree.ElementTree as ET, re
-
-                        root = ET.fromstring(xml_str)
-                        all_nodes = list(root.iter("node"))
-
-                        target_index = None
-                        for i, node in enumerate(all_nodes):
-                            if node.attrib.get("text") == txt:
-                                target_index = i
-                                break
-
-                        if target_index is not None:
-                            button_bounds = None
-                            for j in range(target_index - 1, -1, -1):
-                                cls = all_nodes[j].attrib.get("class", "")
-                                if cls == "android.widget.Button":
-                                    button_bounds = all_nodes[j].attrib.get("bounds")
-                                    print(
-                                        f"Found preceding button for '{txt}': {button_bounds}"
-                                    )
-                                    break
-
-                            if button_bounds:
-                                m = re.match(
-                                    r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]", button_bounds
-                                )
-                                if m:
-                                    x1, y1, x2, y2 = map(int, m.groups())
-                                    cx = (x1 + x2) // 2
-                                    cy = (y1 + y2) // 2
-                                    run_as_root(f"input tap {cx} {cy}")
-                                    print(
-                                        f"Tapped at center of preceding button ({cx}, {cy}) for '{txt}'"
-                                    )
-                                    clicked = True
-                                else:
-                                    print(
-                                        f"Invalid bounds format for button: {button_bounds}"
-                                    )
-                            else:
-                                print(
-                                    f"No preceding android.widget.Button found for '{txt}'"
-                                )
-                        else:
-                            print(f"No node found with text='{txt}' in XML tree")
+                        print(f"No clickable node or ancestor found for '{txt}'")
 
                     response["status"] = "clicked" if clicked else "not_found"
 
@@ -251,7 +198,6 @@ async def handle_command(ws, command):
                     else:
                         button_bounds = None
 
-                        # --- Search backward first ---
                         for j in range(target_index - 1, -1, -1):
                             cls = all_nodes[j].attrib.get("class", "")
                             if "Button" in cls:
@@ -261,7 +207,6 @@ async def handle_command(ws, command):
                                 )
                                 break
 
-                        # --- If not found, search forward ---
                         if not button_bounds:
                             for j in range(target_index + 1, len(all_nodes)):
                                 cls = all_nodes[j].attrib.get("class", "")
@@ -272,7 +217,6 @@ async def handle_command(ws, command):
                                     )
                                     break
 
-                        # --- If still not found, try clickable neighbor ---
                         if not button_bounds:
                             print(
                                 "No Button class found — trying clickable node near target"
@@ -290,7 +234,6 @@ async def handle_command(ws, command):
                                     print(f"Found clickable neighbor: {b}")
                                     break
 
-                        # --- Perform the click if we found something ---
                         if button_bounds:
                             xy = parse_bounds(button_bounds)
                             if xy:
@@ -358,8 +301,53 @@ async def handle_command(ws, command):
                     traceback.print_exc()
                     response["status"] = "error"
                     response["error"] = str(e)
+        elif cmd_type == "clickByDescription":
+            desc = data.get("description")
+            if not desc:
+                response["status"] = "error"
+                response["error"] = "Missing description field"
+            else:
+                try:
+                    d = u2.connect()
+                    print(f"Searching for content-desc: '{desc}'")
 
-        # Wait for UI to stabilize
+                    node = d(description=desc)
+                    if not node.exists:
+                        node = d(text=desc)
+
+                    clicked = False
+                    if node.exists:
+                        info = node.info
+                        if info.get("clickable"):
+                            node.click()
+                            print(
+                                f"Clicked directly on clickable description element: {desc}"
+                            )
+                            clicked = True
+                        else:
+                            xpath_query = f"//*[@content-desc='{desc}']/ancestor::*[@clickable='true']"
+                            if not clicked:
+                                xpath_query = f"//*[@text='{desc}']/ancestor::*[@clickable='true']"
+
+                            parent = d.xpath(xpath_query)
+                            parents = parent.all()
+                            if parents:
+                                parents[0].click()
+                                print(f"Clicked clickable ancestor for '{desc}'")
+                                clicked = True
+                            else:
+                                node.click_exists(timeout=3.0)
+                                print(f"Fallback clicked node bounds for '{desc}'")
+                                clicked = True
+
+                    response["status"] = "clicked" if clicked else "not_found"
+
+                except Exception as e:
+                    print(f"Error in clickByDescription: {e}")
+                    traceback.print_exc()
+                    response["status"] = "error"
+                    response["error"] = str(e)
+
         await asyncio.sleep(10.0)
 
         ok, data = capture_ui_state_zipped()
