@@ -18,10 +18,8 @@ class WebSocketService {
   final _incomingController =
       StreamController<Map<String, dynamic>>.broadcast();
 
-  /// Stream of messages coming from the connected Android device
   Stream<Map<String, dynamic>> get messages => _incomingController.stream;
 
-  /// Connects to the WebSocket API
   Future<void> connect() async {
     final uri = Uri.parse("$apiUrl?deviceId=$deviceId");
     print("Connecting to $uri ...");
@@ -47,7 +45,6 @@ class WebSocketService {
     print("Connected to WebSocket ✅");
   }
 
-  /// Sends a command to the connected Android device
   void sendCommand(Map<String, dynamic> command) {
     if (_channel == null) {
       print("WebSocket not connected.");
@@ -58,7 +55,6 @@ class WebSocketService {
     print("Sent: $payload");
   }
 
-  /// Gracefully close the connection
   Future<void> disconnect() async {
     await _listener?.cancel();
     await _channel?.sink.close(status.goingAway);
